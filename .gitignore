@@ -1,0 +1,10 @@
+.venv/
+.qt_packages/
+__pycache__/
+runs/
+captures/
+verification/
+*.mp4
+*.avi
+*.mov
+*.pt
