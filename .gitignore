@@ -1,6 +1,7 @@
 .venv/
 .qt_packages/
 __pycache__/
+*.pyc
 runs/
 captures/
 verification/
