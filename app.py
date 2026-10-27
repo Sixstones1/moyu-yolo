@@ -33,6 +33,7 @@ from detect_camera import activate_window, list_window_records
 ROOT = PROJECT_ROOT
 PYTHONW = ROOT / ".venv" / "Scripts" / "pythonw.exe"
 DETECTOR = ROOT / "detect_camera.py"
+DEBUG_URL = "http://127.0.0.1:8765/"
 
 
 class BorderFlash(QWidget):
@@ -257,6 +258,10 @@ class MainWindow(QMainWindow):
         self.start_button = QPushButton("开始监测")
         self.start_button.clicked.connect(self.toggle_monitoring)
         run_row.addWidget(self.start_button)
+        self.debug_button = QPushButton("打开调试页")
+        self.debug_button.setObjectName("secondary")
+        self.debug_button.clicked.connect(self.open_debug_page)
+        run_row.addWidget(self.debug_button)
         layout.addLayout(run_row)
 
         log_label = QLabel("运行记录")
@@ -381,6 +386,7 @@ class MainWindow(QMainWindow):
             )
             if self.head_invert_check.isChecked():
                 args.append("--head-yaw-invert")
+            args.extend(["--debug-web", "--debug-web-port", "8765"])
         self.process.setProgram(str(PYTHONW))
         self.process.setArguments(args)
         self.process.start()
@@ -427,6 +433,10 @@ class MainWindow(QMainWindow):
 
     def append_log(self, text):
         self.log.appendPlainText(text)
+
+    def open_debug_page(self):
+        QDesktopServices.openUrl(QUrl(DEBUG_URL))
+        self.append_log(f"已打开头向调试页：{DEBUG_URL}")
 
     def send_private_notification(self):
         try:

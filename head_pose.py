@@ -63,24 +63,41 @@ class HeadPoseEstimator:
             source = model_copy
         options = vision.FaceLandmarkerOptions(
             base_options=python.BaseOptions(model_asset_path=str(source)),
-            running_mode=vision.RunningMode.IMAGE,
+            running_mode=vision.RunningMode.VIDEO,
             num_faces=1,
+            output_facial_transformation_matrixes=True,
             min_face_detection_confidence=min_detection_confidence,
             min_face_presence_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
         )
         self.mp = mp
         self.landmarker = vision.FaceLandmarker.create_from_options(options)
+        self.timestamp_ms = 0
 
-    def estimate(self, frame):
+    def estimate(self, frame, timestamp_ms=None):
         if frame is None or frame.size == 0:
             return None
         height, width = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=rgb)
-        result = self.landmarker.detect(image)
+        if timestamp_ms is None:
+            self.timestamp_ms += 33
+            timestamp_ms = self.timestamp_ms
+        else:
+            self.timestamp_ms = max(self.timestamp_ms + 1, int(timestamp_ms))
+            timestamp_ms = self.timestamp_ms
+        result = self.landmarker.detect_for_video(image, timestamp_ms)
         if not result.face_landmarks:
             return None
+        if result.facial_transformation_matrixes:
+            transform = np.asarray(
+                result.facial_transformation_matrixes[0],
+                dtype=np.float64,
+            ).reshape(4, 4)
+            rotation_matrix = transform[:3, :3]
+            angles, *_ = cv2.RQDecomp3x3(rotation_matrix)
+            pitch, yaw, roll = [float(value) for value in angles]
+            return HeadPose(yaw=yaw, pitch=pitch, roll=roll)
         landmarks = result.face_landmarks[0]
         image_points = np.array(
             [

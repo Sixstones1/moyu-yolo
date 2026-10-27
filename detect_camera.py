@@ -1,4 +1,5 @@
 import argparse
+import base64
 import ctypes
 import shutil
 import tempfile
@@ -9,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from head_pose import HeadPoseEstimator, classify_head_direction
+from head_debug import HeadDebugServer
 import cv2
 import numpy as np
 
@@ -282,6 +284,12 @@ def main():
         action="store_true",
         help="Invert yaw before classifying left and right",
     )
+    parser.add_argument(
+        "--debug-web",
+        action="store_true",
+        help="Serve a local real-time detection debug page",
+    )
+    parser.add_argument("--debug-web-port", type=int, default=8765)
     parser.add_argument("--no-preview", action="store_true")
     parser.add_argument(
         "--capture-dir",
@@ -315,6 +323,8 @@ def main():
         parser.error("--head-smoothing-frames must be at least 1")
     if args.head_left_threshold >= args.head_right_threshold:
         parser.error("--head-left-threshold must be less than --head-right-threshold")
+    if not 0 < args.debug_web_port < 65536:
+        parser.error("--debug-web-port must be between 1 and 65535")
     if args.max_frames < 0:
         parser.error("--max-frames must be non-negative")
     if args.cooldown < 0:
@@ -348,6 +358,15 @@ def main():
     head_candidate_frames = 0
     head_missing_frames = 0
     last_head_yaw = None
+    last_head_pitch = None
+    last_head_roll = None
+    smoothed_yaw = None
+    debug_server = None
+    if args.debug_web:
+        debug_server = HeadDebugServer(port=args.debug_web_port)
+        print(f"Debug web: {debug_server.url}", flush=True)
+    frame_started = time.monotonic()
+    frame_rate = 0.0
     try:
         while True:
             if args.max_frames and frames_seen >= args.max_frames:
@@ -374,12 +393,14 @@ def main():
             trigger_person = False
 
             if head_estimator is not None and frames_seen % args.head_process_every == 0:
-                pose = head_estimator.estimate(frame)
+                pose = head_estimator.estimate(frame, frames_seen * 33)
                 if pose is None:
                     head_missing_frames += 1
                 else:
                     head_missing_frames = 0
                     last_head_yaw = pose.yaw
+                    last_head_pitch = pose.pitch
+                    last_head_roll = pose.roll
                     head_yaws.append(pose.yaw)
                 if head_yaws:
                     smoothed_yaw = float(np.median(head_yaws))
@@ -521,9 +542,46 @@ def main():
                 cv2.imshow("person watch", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
+            if debug_server is not None:
+                elapsed = time.monotonic() - frame_started
+                frame_rate = 1.0 / elapsed if elapsed > 0 else 0.0
+                small_frame = frame
+                if width > 960:
+                    scale = 960 / width
+                    small_frame = cv2.resize(
+                        frame,
+                        (int(width * scale), int(height * scale)),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                encoded, buffer = cv2.imencode(
+                    ".jpg",
+                    small_frame,
+                    [cv2.IMWRITE_JPEG_QUALITY, 75],
+                )
+                if encoded:
+                    debug_server.publish(
+                        {
+                            "frame": base64.b64encode(buffer).decode("ascii"),
+                            "frame_number": frames_seen,
+                            "width": width,
+                            "height": height,
+                            "fps": round(frame_rate, 1),
+                            "direction": head_direction,
+                            "candidate": head_candidate,
+                            "yaw": None if last_head_yaw is None else round(last_head_yaw, 1),
+                            "smooth": None if smoothed_yaw is None else round(smoothed_yaw, 1),
+                            "pitch": None if last_head_pitch is None else round(last_head_pitch, 1),
+                            "roll": None if last_head_roll is None else round(last_head_roll, 1),
+                            "stable": head_candidate_frames,
+                            "missing": head_missing_frames,
+                        }
+                    )
+                frame_started = time.monotonic()
     finally:
         if head_estimator is not None:
             head_estimator.close()
+        if debug_server is not None:
+            debug_server.close()
         camera.release()
         cv2.destroyAllWindows()
 
