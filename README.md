@@ -130,6 +130,14 @@ weights/face_landmarker.task
 
 ## 启动图形界面
 
+也可以直接双击项目目录中的：
+
+```text
+启动项目.bat
+```
+
+它会使用项目自己的 `.venv\Scripts\pythonw.exe` 启动 GUI，并通过隐藏的 `start_hidden.vbs` 运行，不会保留黑色 CMD 窗口。
+
 推荐使用 `pythonw.exe`，这样不会弹出黑色 CMD 窗口：
 
 ```powershell
