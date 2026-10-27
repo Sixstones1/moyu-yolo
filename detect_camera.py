@@ -1,6 +1,7 @@
 import argparse
 import base64
 import ctypes
+import json
 import shutil
 import tempfile
 import time
@@ -9,8 +10,14 @@ from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 
-from head_pose import HeadPoseEstimator, classify_head_direction
-from head_debug import HeadDebugServer
+from head_pose import HeadPoseEstimator, classify_head_direction, resolve_screen_mode
+from head_debug import HeadDebugServer, load_calibration_config
+from face_guard import (
+    DEFAULT_DETECTOR_MODEL,
+    DEFAULT_PROFILE_PATH,
+    DEFAULT_RECOGNIZER_MODEL,
+    FaceGuard,
+)
 import cv2
 import numpy as np
 
@@ -152,9 +159,9 @@ def is_camera_owner(box, frame_width, frame_height):
     x1, y1, x2, y2 = box
     center_x = (x1 + x2) / 2
     return (
-        frame_width * 0.40 < center_x < frame_width * 0.60
-        and y2 > frame_height * 0.92
-        and y2 - y1 > frame_height * 0.38
+        frame_width * 0.35 < center_x < frame_width * 0.65
+        and y2 > frame_height * 0.82
+        and y2 - y1 > frame_height * 0.28
     )
 
 
@@ -210,6 +217,10 @@ def is_trigger_signal(passed, facing_camera, owner, look_trigger):
     return passed or (look_trigger and facing_camera and not owner)
 
 
+def has_required_people(person_count, minimum=2):
+    return person_count >= minimum
+
+
 def save_trigger_frame(frame, directory):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -217,6 +228,34 @@ def save_trigger_frame(frame, directory):
     if not cv2.imwrite(str(path), frame):
         raise OSError(f"Could not save trigger frame to {path}")
     return path
+
+
+def emit_event(event, **values):
+    print(json.dumps({"event": event, **values}, ensure_ascii=False), flush=True)
+
+
+def advance_face_presence(
+    state,
+    missing_since,
+    present_since,
+    matched,
+    now,
+    absence_timeout,
+    return_timeout,
+):
+    if matched:
+        missing_since = None
+        present_since = present_since if present_since is not None else now
+        if state == "absent" and now - present_since >= return_timeout:
+            return "present", missing_since, present_since, "present"
+        if state == "unknown":
+            return "present", missing_since, present_since, None
+    else:
+        present_since = None
+        missing_since = missing_since if missing_since is not None else now
+        if state != "absent" and now - missing_since >= absence_timeout:
+            return "absent", missing_since, present_since, "absent"
+    return state, missing_since, present_since, None
 
 
 def main():
@@ -246,6 +285,7 @@ def main():
     )
     parser.add_argument("--confidence", type=float, default=0.35)
     parser.add_argument("--trigger-frames", type=int, default=6)
+    parser.add_argument("--minimum-people", type=int, default=2)
     parser.add_argument(
         "--movement-pixels",
         type=int,
@@ -292,6 +332,26 @@ def main():
     parser.add_argument("--debug-web-port", type=int, default=8765)
     parser.add_argument("--no-preview", action="store_true")
     parser.add_argument(
+        "--no-activate",
+        action="store_true",
+        help="Only report triggers; let the GUI decide whether to activate a window",
+    )
+    parser.add_argument("--face-profile", default=str(DEFAULT_PROFILE_PATH))
+    parser.add_argument("--face-detector-model", default=str(DEFAULT_DETECTOR_MODEL))
+    parser.add_argument(
+        "--face-recognizer-model", default=str(DEFAULT_RECOGNIZER_MODEL)
+    )
+    parser.add_argument("--face-match-threshold", type=float, default=0.363)
+    parser.add_argument("--absence-protection", action="store_true")
+    parser.add_argument("--absence-timeout", type=float, default=5.0)
+    parser.add_argument("--return-timeout", type=float, default=1.0)
+    parser.add_argument(
+        "--face-check-every",
+        type=int,
+        default=15,
+        help="本人核验间隔；默认约为 30 FPS 下的 0.5 秒",
+    )
+    parser.add_argument(
         "--capture-dir",
         default=str(Path(__file__).parent / "captures"),
         help="Directory for trigger-frame screenshots",
@@ -313,8 +373,8 @@ def main():
         parser.error("--confidence must be between 0 and 1")
     if args.trigger_frames < 1:
         parser.error("--trigger-frames must be at least 1")
-    if args.movement_pixels < 1:
-        parser.error("--movement-pixels must be at least 1")
+    if args.minimum_people < 1:
+        parser.error("--minimum-people must be at least 1")
     if args.head_process_every < 1:
         parser.error("--head-process-every must be at least 1")
     if args.head_stability_frames < 1:
@@ -331,6 +391,12 @@ def main():
         parser.error("--cooldown must be non-negative")
     if not 0 < args.zone_bottom <= 1:
         parser.error("--zone-bottom must be in (0, 1]")
+    if not 0 < args.face_match_threshold <= 1:
+        parser.error("--face-match-threshold must be in (0, 1]")
+    if args.absence_timeout < 0 or args.return_timeout < 0:
+        parser.error("face timeouts must be non-negative")
+    if args.face_check_every < 1:
+        parser.error("--face-check-every must be at least 1")
 
     head_estimator = HeadPoseEstimator() if args.head_direction else None
     if head_estimator is not None:
@@ -352,21 +418,48 @@ def main():
     track_history = defaultdict(lambda: deque(maxlen=10))
     frames_seen = 0
     face_detector = create_face_detector() if args.look_trigger else None
+    face_guard = None
+    if Path(args.face_profile).is_file():
+        try:
+            face_guard = FaceGuard(
+                args.face_detector_model,
+                args.face_recognizer_model,
+                args.face_profile,
+            )
+            if face_guard.profile is None:
+                print("Face recognition disabled: no enrolled face profile", flush=True)
+                face_guard = None
+            else:
+                print("Face recognition enabled: local SFace profile", flush=True)
+        except (FileNotFoundError, OSError, ValueError, cv2.error) as error:
+            print(f"Face recognition disabled: {error}", flush=True)
     head_yaws = deque(maxlen=args.head_smoothing_frames)
     head_direction = "unknown"
     head_candidate = "unknown"
     head_candidate_frames = 0
     head_missing_frames = 0
+    screen_candidate_frames = 0
     last_head_yaw = None
     last_head_pitch = None
     last_head_roll = None
     smoothed_yaw = None
+    effective_yaw = None
+    screen_mode = "unknown"
+    screen_candidate = "none"
     debug_server = None
     if args.debug_web:
         debug_server = HeadDebugServer(port=args.debug_web_port)
         print(f"Debug web: {debug_server.url}", flush=True)
+    config = (
+        debug_server.get_config()
+        if debug_server is not None
+        else load_calibration_config()
+    )
     frame_started = time.monotonic()
     frame_rate = 0.0
+    face_state = "unknown"
+    face_missing_since = None
+    face_present_since = None
     try:
         while True:
             if args.max_frames and frames_seen >= args.max_frames:
@@ -390,10 +483,45 @@ def main():
                 tracker="bytetrack.yaml",
                 verbose=False,
             )[0]
-            trigger_person = False
-
+            person_count = len(result.boxes)
+            face_score = None
             if head_estimator is not None and frames_seen % args.head_process_every == 0:
-                pose = head_estimator.estimate(frame, frames_seen * 33)
+                face_crop = frame
+                if face_guard is not None:
+                    face_score, _face_count, matched_crop = face_guard.matching_crop(
+                        frame, args.face_match_threshold
+                    )
+                    if matched_crop is not None:
+                        face_crop = matched_crop
+                    else:
+                        face_crop = None
+                    now = time.monotonic()
+                    if args.absence_protection and frames_seen % args.face_check_every == 0:
+                        matched = matched_crop is not None
+                        face_state, face_missing_since, face_present_since, transition = (
+                            advance_face_presence(
+                                face_state,
+                                face_missing_since,
+                                face_present_since,
+                                matched,
+                                now,
+                                args.absence_timeout,
+                                args.return_timeout,
+                            )
+                        )
+                        if transition:
+                            emit_event("protection", state=transition)
+                        emit_event(
+                            "face_status",
+                            state=face_state,
+                            score=face_score,
+                            face_count=_face_count,
+                        )
+                pose = (
+                    head_estimator.estimate(face_crop, frames_seen * 33)
+                    if face_crop is not None
+                    else None
+                )
                 if pose is None:
                     head_missing_frames += 1
                 else:
@@ -404,6 +532,9 @@ def main():
                     head_yaws.append(pose.yaw)
                 if head_yaws:
                     smoothed_yaw = float(np.median(head_yaws))
+                    effective_yaw = (
+                        -smoothed_yaw if args.head_yaw_invert else smoothed_yaw
+                    )
                     raw_direction = classify_head_direction(
                         smoothed_yaw,
                         args.head_left_threshold,
@@ -412,14 +543,26 @@ def main():
                     )
                 else:
                     smoothed_yaw = None
+                    effective_yaw = None
                     raw_direction = "unknown"
                 if head_missing_frames >= args.head_stability_frames * 2:
                     raw_direction = "unknown"
+                    effective_yaw = None
                 if raw_direction == head_candidate:
                     head_candidate_frames += 1
                 else:
                     head_candidate = raw_direction
                     head_candidate_frames = 1
+                if debug_server is not None:
+                    config = debug_server.get_config()
+                elif frames_seen % args.head_process_every == 0:
+                    config = load_calibration_config()
+                raw_screen_mode = resolve_screen_mode(effective_yaw, config)
+                if raw_screen_mode == screen_candidate:
+                    screen_candidate_frames += 1
+                else:
+                    screen_candidate = raw_screen_mode
+                    screen_candidate_frames = 1
                 if (
                     head_candidate_frames >= args.head_stability_frames
                     and head_direction != head_candidate
@@ -429,6 +572,24 @@ def main():
                     print(
                         f"Head direction: {head_direction} yaw={yaw_text}",
                         flush=True,
+                    )
+                    emit_event(
+                        "head",
+                        direction=head_direction,
+                        yaw=last_head_yaw,
+                        mode=screen_mode,
+                    )
+                if (
+                    screen_candidate_frames >= args.head_stability_frames
+                    and screen_mode != screen_candidate
+                ):
+                    screen_mode = screen_candidate
+                    yaw_text = "none" if effective_yaw is None else f"{effective_yaw:.1f}"
+                    print(f"Screen mode: {screen_mode} yaw={yaw_text}", flush=True)
+                    emit_event(
+                        "screen",
+                        mode=screen_mode,
+                        yaw=effective_yaw,
                     )
 
             track_ids = (
@@ -441,27 +602,17 @@ def main():
             ):
                 coordinates = box.tolist()
                 x1, y1, x2, y2 = [int(value) for value in coordinates]
-                in_zone = is_background_candidate(
-                    coordinates, width, height, args.zone_bottom
-                )
                 owner = is_camera_owner(coordinates, width, height)
                 center = ((x1 + x2) / 2, (y1 + y2) / 2)
                 history = track_history[track_id] if track_id is not None else ()
                 passed = (
-                    in_zone
-                    and track_id is not None
+                    track_id is not None
                     and has_moved(history, center, args.movement_pixels)
                 )
                 facing_camera = False
                 if not owner and face_detector is not None:
                     crop = frame[max(0, y1):min(height, y2), max(0, x1):min(width, x2)]
                     facing_camera = face_looks_toward_camera(face_detector, crop)
-                trigger_person = trigger_person or is_trigger_signal(
-                    passed,
-                    facing_camera,
-                    owner,
-                    args.look_trigger,
-                )
                 color = (0, 200, 0) if passed else (120, 120, 120)
                 label = f"person {float(confidence):.2f}"
                 if passed:
@@ -480,6 +631,7 @@ def main():
                     2,
                 )
 
+            trigger_person = has_required_people(person_count, args.minimum_people)
             consecutive = consecutive + 1 if trigger_person else 0
             stale_ids = [
                 track_id
@@ -502,12 +654,25 @@ def main():
                 )
                 capture_path = save_trigger_frame(frame, args.capture_dir)
                 print(f"Capture saved: {capture_path.resolve()}")
+                emit_event(
+                    "capture",
+                    path=str(capture_path.resolve()),
+                    person_count=person_count,
+                )
                 print(
                     "Trigger detected: "
-                    f"passing after {args.trigger_frames} consecutive frames",
+                    f"{person_count} people after {args.trigger_frames} consecutive frames",
                     flush=True,
                 )
-                if args.dry_run:
+                emit_event(
+                    "trigger",
+                    reason="people",
+                    person_count=person_count,
+                    frames=args.trigger_frames,
+                )
+                if args.no_activate:
+                    print("GUI HANDOFF: window activation delegated", flush=True)
+                elif args.dry_run:
                     print(f"DRY RUN: would activate a window matching {args.ide_title!r}")
                 else:
                     activated_title = activate_window(
@@ -522,12 +687,13 @@ def main():
                 consecutive = 0
 
             status = (
-                f"person={int(trigger_person)} "
+                f"people={person_count} "
+                f"trigger={int(trigger_person)} "
                 f"frames={consecutive}/{args.trigger_frames}"
             )
             if head_estimator is not None:
                 yaw_text = "none" if last_head_yaw is None else f"{last_head_yaw:.1f}"
-                status += f" head={head_direction} yaw={yaw_text}"
+                status += f" mode={screen_mode} head={head_direction} yaw={yaw_text}"
             cv2.rectangle(frame, (0, 0), (width - 1, zone_bottom), (255, 180, 0), 1)
             cv2.putText(
                 frame,
@@ -563,17 +729,37 @@ def main():
                         {
                             "frame": base64.b64encode(buffer).decode("ascii"),
                             "frame_number": frames_seen,
+                            "person_count": person_count,
+                            "person_trigger": trigger_person,
+                            "person_frames": consecutive,
+                            "trigger_frames": args.trigger_frames,
+                            "face_state": face_state,
+                            "face_score": (
+                                None if face_score is None else round(face_score, 3)
+                            ),
                             "width": width,
                             "height": height,
                             "fps": round(frame_rate, 1),
                             "direction": head_direction,
-                            "candidate": head_candidate,
+                            "mode": screen_mode,
+                            "candidate": screen_candidate,
                             "yaw": None if last_head_yaw is None else round(last_head_yaw, 1),
+                            "effective_yaw": (
+                                None if effective_yaw is None else round(effective_yaw, 1)
+                            ),
                             "smooth": None if smoothed_yaw is None else round(smoothed_yaw, 1),
                             "pitch": None if last_head_pitch is None else round(last_head_pitch, 1),
                             "roll": None if last_head_roll is None else round(last_head_roll, 1),
-                            "stable": head_candidate_frames,
+                            "stable": screen_candidate_frames,
                             "missing": head_missing_frames,
+                            "test_mode": config.get("test_mode", "auto"),
+                            "person_count": person_count,
+                            "person_trigger": trigger_person,
+                            "person_frames": consecutive,
+                            "trigger_frames": args.trigger_frames,
+                            "face_state": face_state,
+                            "face_score": face_score,
+                            "config": config,
                         }
                     )
                 frame_started = time.monotonic()

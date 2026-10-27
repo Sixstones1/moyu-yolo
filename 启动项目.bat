@@ -1,18 +1,22 @@
 @echo off
 setlocal
 set "ROOT=%~dp0"
+set "PYTHONW=%ROOT%.venv\Scripts\pythonw.exe"
+set "APP=%ROOT%app.py"
 
-if not exist "%ROOT%.venv\Scripts\pythonw.exe" (
-    echo Missing .venv\Scripts\pythonw.exe
+if not exist "%PYTHONW%" (
+    echo Python runtime not found: "%PYTHONW%"
+    echo Run the project environment setup first.
     pause
     exit /b 1
 )
 
-if not exist "%ROOT%app.py" (
-    echo Missing app.py
+if not exist "%APP%" (
+    echo Application entry point not found: "%APP%"
     pause
     exit /b 1
 )
 
-wscript.exe "%ROOT%start_hidden.vbs"
-exit /b 0
+cd /d "%ROOT%"
+start "" "%PYTHONW%" "%APP%"
+exit /b

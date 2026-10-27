@@ -26,6 +26,26 @@ def classify_head_direction(yaw, left_threshold, right_threshold, invert=False):
     return "center"
 
 
+def classify_screen_mode(yaw, config):
+    if yaw is None:
+        return "none"
+
+    matches = []
+    for name in ("both", "left", "right"):
+        center = float(config[f"{name}_center"])
+        radius = max(0.1, float(config[f"{name}_range"]))
+        if center - radius <= yaw <= center + radius:
+            matches.append((abs(yaw - center), name))
+    return min(matches)[1] if matches else "none"
+
+
+def resolve_screen_mode(yaw, config):
+    test_mode = config.get("test_mode", "auto")
+    if test_mode in ("both", "left", "right", "none"):
+        return test_mode
+    return classify_screen_mode(yaw, config)
+
+
 class HeadPoseEstimator:
     _LANDMARK_IDS = (1, 152, 33, 263, 61, 291)
     _MODEL_POINTS = np.array(

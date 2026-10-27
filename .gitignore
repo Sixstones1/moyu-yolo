@@ -10,3 +10,6 @@ verification/
 *.mov
 *.pt
 *.task
+*.onnx
+face_profile.json
+head_calibration.json
