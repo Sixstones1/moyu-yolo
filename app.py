@@ -6,11 +6,13 @@ QT_PACKAGES = PROJECT_ROOT / ".qt_packages"
 if QT_PACKAGES.is_dir():
     sys.path.insert(0, str(QT_PACKAGES))
 
-from PySide6.QtCore import QProcess, Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QFont
+from PySide6.QtCore import QProcess, Qt, QTimer, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QCheckBox,
+    QDoubleSpinBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -33,19 +35,43 @@ PYTHONW = ROOT / ".venv" / "Scripts" / "pythonw.exe"
 DETECTOR = ROOT / "detect_camera.py"
 
 
+class BorderFlash(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+            | Qt.WindowType.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setWindowOpacity(0.9)
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#e32636"), 8))
+        painter.drawRect(self.rect().adjusted(4, 4, -5, -5))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("身后有人提醒")
-        self.setMinimumSize(620, 460)
+        self.setMinimumSize(760, 620)
         self.process = QProcess(self)
         self.process.setWorkingDirectory(str(ROOT))
         self.process.readyReadStandardOutput.connect(self.read_output)
         self.process.readyReadStandardError.connect(self.read_error)
         self.process.finished.connect(self.process_finished)
         self.latest_capture = None
+        self.alert_windows = []
         self.build_ui()
         self.refresh_windows()
+        self.refresh_captures()
 
     def build_ui(self):
         root = QWidget()
@@ -84,6 +110,71 @@ class MainWindow(QMainWindow):
         target_layout.addWidget(self.test_button, 1, 2)
         layout.addWidget(target_group)
 
+        settings_group = QFrame()
+        settings_group.setObjectName("section")
+        settings_layout = QGridLayout(settings_group)
+        settings_layout.setContentsMargins(18, 16, 18, 16)
+        settings_layout.setHorizontalSpacing(12)
+        settings_layout.setVerticalSpacing(10)
+        settings_layout.addWidget(QLabel("连续触发帧数"), 0, 0)
+        self.trigger_frames_spin = QSpinBox()
+        self.trigger_frames_spin.setRange(1, 120)
+        self.trigger_frames_spin.setValue(6)
+        settings_layout.addWidget(self.trigger_frames_spin, 0, 1)
+        settings_layout.addWidget(QLabel("最小移动像素"), 0, 2)
+        self.movement_pixels_spin = QSpinBox()
+        self.movement_pixels_spin.setRange(1, 500)
+        self.movement_pixels_spin.setValue(18)
+        settings_layout.addWidget(self.movement_pixels_spin, 0, 3)
+        settings_layout.addWidget(QLabel("YOLO 置信度"), 1, 0)
+        self.confidence_spin = QDoubleSpinBox()
+        self.confidence_spin.setRange(0.05, 0.95)
+        self.confidence_spin.setSingleStep(0.05)
+        self.confidence_spin.setDecimals(2)
+        self.confidence_spin.setValue(0.35)
+        settings_layout.addWidget(self.confidence_spin, 1, 1)
+        settings_layout.addWidget(QLabel("冷却秒数"), 1, 2)
+        self.cooldown_spin = QDoubleSpinBox()
+        self.cooldown_spin.setRange(0, 300)
+        self.cooldown_spin.setSingleStep(1)
+        self.cooldown_spin.setDecimals(1)
+        self.cooldown_spin.setValue(10)
+        settings_layout.addWidget(self.cooldown_spin, 1, 3)
+        settings_layout.addWidget(QLabel("背景区域底边"), 2, 0)
+        self.zone_bottom_spin = QDoubleSpinBox()
+        self.zone_bottom_spin.setRange(0.1, 1.0)
+        self.zone_bottom_spin.setSingleStep(0.05)
+        self.zone_bottom_spin.setDecimals(2)
+        self.zone_bottom_spin.setValue(0.72)
+        settings_layout.addWidget(self.zone_bottom_spin, 2, 1)
+        self.look_trigger_check = QCheckBox("正脸辅助触发")
+        self.look_trigger_check.setToolTip("默认关闭，避免你看屏幕时被误判为触发")
+        settings_layout.addWidget(self.look_trigger_check, 2, 2)
+        self.notification_check = QCheckBox("Windows 通知")
+        self.notification_check.setToolTip("系统通知可能有延迟，默认关闭")
+        settings_layout.addWidget(self.notification_check, 2, 3)
+        layout.addWidget(settings_group)
+
+        capture_group = QFrame()
+        capture_group.setObjectName("section")
+        capture_layout = QGridLayout(capture_group)
+        capture_layout.setContentsMargins(18, 12, 18, 12)
+        capture_layout.setHorizontalSpacing(12)
+        capture_layout.addWidget(QLabel("触发截图历史"), 0, 0)
+        self.capture_combo = QComboBox()
+        self.capture_combo.setMinimumWidth(470)
+        self.capture_combo.activated.connect(self.open_selected_capture)
+        capture_layout.addWidget(self.capture_combo, 0, 1)
+        self.refresh_capture_button = QPushButton("刷新")
+        self.refresh_capture_button.setObjectName("secondary")
+        self.refresh_capture_button.clicked.connect(lambda: self.refresh_captures())
+        capture_layout.addWidget(self.refresh_capture_button, 0, 2)
+        self.capture_button = QPushButton("打开")
+        self.capture_button.setObjectName("secondary")
+        self.capture_button.clicked.connect(self.open_selected_capture)
+        capture_layout.addWidget(self.capture_button, 0, 3)
+        layout.addWidget(capture_group)
+
         run_row = QHBoxLayout()
         self.status_label = QLabel("未启动")
         self.status_label.setObjectName("status")
@@ -92,11 +183,6 @@ class MainWindow(QMainWindow):
         self.start_button = QPushButton("开始监测")
         self.start_button.clicked.connect(self.toggle_monitoring)
         run_row.addWidget(self.start_button)
-        self.capture_button = QPushButton("查看截图")
-        self.capture_button.setObjectName("secondary")
-        self.capture_button.setEnabled(False)
-        self.capture_button.clicked.connect(self.open_latest_capture)
-        run_row.addWidget(self.capture_button)
         layout.addLayout(run_row)
 
         log_label = QLabel("运行记录")
@@ -191,8 +277,20 @@ class MainWindow(QMainWindow):
             title,
             "--ide-hwnd",
             str(self.window_combo.currentData() or 0),
+            "--confidence",
+            str(self.confidence_spin.value()),
+            "--trigger-frames",
+            str(self.trigger_frames_spin.value()),
+            "--movement-pixels",
+            str(self.movement_pixels_spin.value()),
+            "--cooldown",
+            str(self.cooldown_spin.value()),
+            "--zone-bottom",
+            str(self.zone_bottom_spin.value()),
             "--no-preview",
         ]
+        if self.look_trigger_check.isChecked():
+            args.append("--look-trigger")
         self.process.setProgram(str(PYTHONW))
         self.process.setArguments(args)
         self.process.start()
@@ -210,10 +308,14 @@ class MainWindow(QMainWindow):
             self.append_log(line)
             if line.startswith("Capture saved: "):
                 self.latest_capture = Path(line.removeprefix("Capture saved: ").strip())
-                self.capture_button.setEnabled(self.latest_capture.is_file())
+                self.refresh_captures(self.latest_capture)
+            elif line.startswith("Trigger detected:"):
+                self.status_label.setText("检测到触发，正在切换")
+                self.show_border_flash()
             elif line.startswith("Triggered:"):
                 self.status_label.setText("已切换到目标应用")
-                self.send_private_notification()
+                if self.notification_check.isChecked():
+                    self.send_private_notification()
 
     def read_error(self):
         text = bytes(self.process.readAllStandardError()).decode("utf-8", errors="replace")
@@ -241,9 +343,49 @@ class MainWindow(QMainWindow):
         except Exception as error:
             self.append_log(f"Windows 通知发送失败：{error}")
 
-    def open_latest_capture(self):
-        if self.latest_capture and self.latest_capture.is_file():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.latest_capture)))
+    def refresh_captures(self, select_path=None):
+        capture_dir = ROOT / "captures"
+        paths = sorted(
+            (path for path in capture_dir.glob("*.jpg") if path.is_file()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        self.capture_combo.blockSignals(True)
+        self.capture_combo.clear()
+        for path in paths:
+            self.capture_combo.addItem(path.name, str(path))
+        self.capture_combo.blockSignals(False)
+        if not paths:
+            self.capture_button.setEnabled(False)
+            self.latest_capture = None
+            return
+        self.capture_button.setEnabled(True)
+        selected = Path(select_path) if select_path else paths[0]
+        index = self.capture_combo.findData(str(selected))
+        if index < 0:
+            index = 0
+        self.capture_combo.setCurrentIndex(index)
+        self.latest_capture = Path(self.capture_combo.currentData())
+
+    def open_selected_capture(self, _index=None):
+        path = self.capture_combo.currentData()
+        if path and Path(path).is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def show_border_flash(self):
+        for screen in QApplication.screens():
+            border = BorderFlash()
+            border.setGeometry(screen.geometry())
+            border.show()
+            border.raise_()
+            self.alert_windows.append(border)
+            QTimer.singleShot(900, lambda widget=border: self.hide_border_flash(widget))
+
+    def hide_border_flash(self, widget):
+        widget.hide()
+        widget.deleteLater()
+        if widget in self.alert_windows:
+            self.alert_windows.remove(widget)
 
     def closeEvent(self, event):
         if self.process.state() != QProcess.ProcessState.NotRunning:

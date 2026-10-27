@@ -203,6 +203,10 @@ def face_looks_toward_camera(face_detector, crop):
     return len(faces) > 0
 
 
+def is_trigger_signal(passed, facing_camera, owner, look_trigger):
+    return passed or (look_trigger and facing_camera and not owner)
+
+
 def save_trigger_frame(frame, directory):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -238,13 +242,24 @@ def main():
         help="Selected window handle; survives title changes",
     )
     parser.add_argument("--confidence", type=float, default=0.35)
-    parser.add_argument("--trigger-frames", type=int, default=3)
+    parser.add_argument("--trigger-frames", type=int, default=6)
+    parser.add_argument(
+        "--movement-pixels",
+        type=int,
+        default=18,
+        help="Minimum tracked-center movement in pixels",
+    )
     parser.add_argument("--cooldown", type=float, default=10.0)
     parser.add_argument(
         "--zone-bottom",
         type=float,
         default=0.72,
         help="Bottom edge of the background zone as a fraction of frame height",
+    )
+    parser.add_argument(
+        "--look-trigger",
+        action="store_true",
+        help="Also trigger for a non-owner person facing the camera",
     )
     parser.add_argument("--no-preview", action="store_true")
     parser.add_argument(
@@ -269,6 +284,8 @@ def main():
         parser.error("--confidence must be between 0 and 1")
     if args.trigger_frames < 1:
         parser.error("--trigger-frames must be at least 1")
+    if args.movement_pixels < 1:
+        parser.error("--movement-pixels must be at least 1")
     if args.max_frames < 0:
         parser.error("--max-frames must be non-negative")
     if args.cooldown < 0:
@@ -290,7 +307,7 @@ def main():
     last_trigger = 0.0
     track_history = defaultdict(lambda: deque(maxlen=10))
     frames_seen = 0
-    face_detector = create_face_detector()
+    face_detector = create_face_detector() if args.look_trigger else None
     try:
         while True:
             if args.max_frames and frames_seen >= args.max_frames:
@@ -335,14 +352,17 @@ def main():
                 passed = (
                     in_zone
                     and track_id is not None
-                    and has_moved(history, center, max(18, int(width * 0.025)))
+                    and has_moved(history, center, args.movement_pixels)
                 )
                 facing_camera = False
                 if not owner and face_detector is not None:
                     crop = frame[max(0, y1):min(height, y2), max(0, x1):min(width, x2)]
                     facing_camera = face_looks_toward_camera(face_detector, crop)
-                trigger_person = trigger_person or (
-                    passed or (facing_camera and not owner)
+                trigger_person = trigger_person or is_trigger_signal(
+                    passed,
+                    facing_camera,
+                    owner,
+                    args.look_trigger,
                 )
                 color = (0, 200, 0) if passed else (120, 120, 120)
                 label = f"person {float(confidence):.2f}"
@@ -384,6 +404,11 @@ def main():
                 )
                 capture_path = save_trigger_frame(frame, args.capture_dir)
                 print(f"Capture saved: {capture_path.resolve()}")
+                print(
+                    "Trigger detected: "
+                    f"passing after {args.trigger_frames} consecutive frames",
+                    flush=True,
+                )
                 if args.dry_run:
                     print(f"DRY RUN: would activate a window matching {args.ide_title!r}")
                 else:

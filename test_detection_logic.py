@@ -11,6 +11,7 @@ from detect_camera import (
     is_background_candidate,
     is_background_person,
     is_camera_owner,
+    is_trigger_signal,
     save_trigger_frame,
     title_matches_window,
     window_match_fragments,
@@ -58,6 +59,11 @@ class DetectionLogicTests(unittest.TestCase):
         crop = np.zeros((48, 48, 3), dtype=np.uint8)
         self.assertTrue(face_looks_toward_camera(FakeFaceDetector([(1, 1, 24, 24)]), crop))
         self.assertFalse(face_looks_toward_camera(FakeFaceDetector(()), crop))
+
+    def test_look_signal_is_disabled_by_default(self):
+        self.assertFalse(is_trigger_signal(False, True, False, False))
+        self.assertTrue(is_trigger_signal(False, True, False, True))
+        self.assertFalse(is_trigger_signal(False, True, True, True))
 
     def test_trigger_frame_is_saved_as_jpeg(self):
         with TemporaryDirectory() as directory:
