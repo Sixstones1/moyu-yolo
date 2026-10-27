@@ -1,5 +1,6 @@
 ultralytics==8.4.189
 opencv-python==4.11.0.86
+mediapipe==0.10.21
 lap==0.5.13
 PySide6==6.6.3
 winotify==1.1.0

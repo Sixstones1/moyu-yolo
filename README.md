@@ -22,6 +22,8 @@
   - 内容：`请确认周围情况`
 - PySide6 GUI 使用 `pythonw.exe` 启动，不弹出黑色控制台窗口。
 - GUI 可以配置连续触发帧数、最小移动像素、YOLO 置信度、冷却时间、背景区域和正脸辅助触发。
+- 使用同一个摄像头循环增加头部方向检测，不启动第二个 YOLO 进程。
+- 可选地在检测到你看向左屏或右屏时，给另一块显示器覆盖半透明遮罩。
 - 支持摄像头实时检测、录制视频回放和 dry-run 调试。
 
 ## 工作流程
@@ -50,6 +52,7 @@ YOLO person 检测 + ByteTrack 跟踪
 .
 ├── app.py                   # PySide6 图形界面
 ├── detect_camera.py         # 摄像头、视频回放和检测逻辑
+├── head_pose.py             # MediaPipe 人脸关键点和头部 yaw 估计
 ├── test_detection_logic.py  # 检测逻辑单元测试
 ├── requirements.txt         # Python 依赖
 ├── weights/
@@ -93,7 +96,7 @@ py -3 -m venv .venv
 如果 Windows 拒绝把 Qt DLL 写入虚拟环境，可以把 PySide6 安装到项目隔离目录：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install ultralytics==8.4.189 opencv-python==4.11.0.86 lap==0.5.13 winotify==1.1.0
+.\.venv\Scripts\python.exe -m pip install ultralytics==8.4.189 opencv-python==4.11.0.86 mediapipe==0.10.21 lap==0.5.13 winotify==1.1.0
 .\.venv\Scripts\python.exe -m pip install --target .qt_packages PySide6==6.6.3
 ```
 
@@ -114,6 +117,14 @@ New-Item -ItemType Directory -Force weights | Out-Null
 .\.venv\Scripts\python.exe -c "from ultralytics import YOLO; YOLO('yolo26n.pt')"
 Move-Item .\yolo26n.pt .\weights\yolo26n.pt
 ```
+
+头部方向检测还需要 MediaPipe Face Landmarker 模型：
+
+```text
+weights/face_landmarker.task
+```
+
+将官方 `face_landmarker.task` 放入 `weights/` 后，勾选 GUI 中的“头向检测”或“另一块屏幕遮罩”即可启用。模型权重和任务文件都被 `.gitignore` 忽略，不会提交到公共仓库。
 
 模型权重被 `.gitignore` 忽略，不应该提交到公共仓库。
 
@@ -137,7 +148,9 @@ GUI 使用方式：
 8. 检测触发后会先保存截图并显示红色屏幕边框，然后切换到目标窗口。
 9. 在“触发截图历史”中选择任意历史截图，点击“打开”查看；新截图会自动选中。
 10. 如果需要 Windows 通知，再勾选“Windows 通知”；系统通知可能仍受 Windows 通知中心延迟影响。
-11. 点击“停止监测”结束摄像头子进程。
+11. 勾选“头向检测”可在运行记录中显示当前方向；勾选“另一块屏幕遮罩”后，看左屏会遮右屏，看右屏会遮左屏。
+12. 可以先点击“测试遮左屏”“测试遮右屏”检查两块显示器映射，点击“关闭遮罩”恢复。
+13. 点击“停止监测”结束摄像头子进程。
 
 如果目标应用完全关闭后重新打开，Windows 窗口句柄会发生变化，需要点击“刷新”并重新选择窗口。
 
@@ -211,6 +224,12 @@ Dry-run 会运行检测逻辑，但不会真正激活目标窗口：
 | `--cooldown` | `10` | 两次触发之间的冷却时间，单位为秒 |
 | `--zone-bottom` | `0.72` | 背景检测区域底边占画面高度的比例 |
 | `--look-trigger` | 关闭 | 额外启用非本人正面人脸触发；默认关闭以避免看屏幕误触发 |
+| `--head-direction` | 关闭 | 在同一个摄像头循环中估计头部左右方向 |
+| `--head-process-every` | `2` | 每隔多少帧运行一次头部姿态估计 |
+| `--head-left-threshold` | `-12` | yaw 小于等于此值时判断为左侧 |
+| `--head-right-threshold` | `12` | yaw 大于等于此值时判断为右侧 |
+| `--head-stability-frames` | `5` | 连续稳定多少次才切换方向 |
+| `--head-yaw-invert` | 关闭 | 摄像头左右方向相反时反转 yaw |
 | `--capture-dir` | `captures` | 触发截图保存目录 |
 | `--no-preview` | 关闭 | 不显示 OpenCV 预览窗口 |
 | `--dry-run` | 关闭 | 只报告触发，不激活窗口 |
@@ -234,6 +253,14 @@ Dry-run 会运行检测逻辑，但不会真正激活目标窗口：
 实际触发条件是：连续 `--trigger-frames` 帧检测到触发信号。GUI 默认是 6 帧，摄像头约 30 FPS 时理论上约 0.2 秒；如果画面抖动或人物框不稳定，建议从 8 到 12 帧开始测试。程序触发时会在运行记录中输出实际使用的连续帧数。
 
 项目还保留了正面人脸近似判断，用于辅助判断非本人是否朝向摄像头。它不是眼球视线识别，侧脸、遮挡、低分辨率和远距离人物可能无法判断。
+
+## 头部方向和显示器遮罩
+
+头部方向检测与 YOLO 共用一次摄像头读取和同一个主循环：YOLO 继续检测身后经过的人，MediaPipe Face Mesh 在相同的视频帧上估计你的头部 yaw。程序不会再启动第二个 YOLO，也不会重复打开摄像头。默认每 2 帧运行一次头部估计，并用连续稳定帧数减少抖动。
+
+当前第一版的“毛玻璃”是逐显示器的半透明深色遮罩，用于先验证左右方向、显示器顺序和切换时机。显示器按 Windows 虚拟桌面坐标从左到右排序：看左屏时遮右侧显示器，看右屏时遮左侧显示器。如果摄像头造成左右相反，勾选“反转左右”。
+
+头部方向判断不是直接使用固定相机方向，而是使用 yaw 阈值。侧面摄像头、坐姿和显示器夹角不同，建议先运行并观察日志中的方向，再调整左右阈值。后续可以增加“看左屏 / 看右屏”校准流程，把固定阈值替换为你的实际校准数据，并将半透明遮罩升级为 Windows Composition 的真正背景模糊。
 
 ## 触发截图
 

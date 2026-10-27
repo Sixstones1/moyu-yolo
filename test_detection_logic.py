@@ -16,6 +16,7 @@ from detect_camera import (
     title_matches_window,
     window_match_fragments,
 )
+from head_pose import classify_head_direction
 
 
 class FakeFaceDetector:
@@ -64,6 +65,13 @@ class DetectionLogicTests(unittest.TestCase):
         self.assertFalse(is_trigger_signal(False, True, False, False))
         self.assertTrue(is_trigger_signal(False, True, False, True))
         self.assertFalse(is_trigger_signal(False, True, True, True))
+
+    def test_head_direction_thresholds_and_inversion(self):
+        self.assertEqual(classify_head_direction(-20, -12, 12), "left")
+        self.assertEqual(classify_head_direction(20, -12, 12), "right")
+        self.assertEqual(classify_head_direction(0, -12, 12), "center")
+        self.assertEqual(classify_head_direction(-20, -12, 12, invert=True), "right")
+        self.assertEqual(classify_head_direction(None, -12, 12), "unknown")
 
     def test_trigger_frame_is_saved_as_jpeg(self):
         with TemporaryDirectory() as directory:

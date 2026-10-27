@@ -8,8 +8,9 @@ from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 
+from head_pose import HeadPoseEstimator, classify_head_direction
 import cv2
-from ultralytics import YOLO
+import numpy as np
 
 
 def window_match_fragments(title_fragment):
@@ -261,6 +262,26 @@ def main():
         action="store_true",
         help="Also trigger for a non-owner person facing the camera",
     )
+    parser.add_argument(
+        "--head-direction",
+        action="store_true",
+        help="Estimate the camera owner's head direction in the same camera loop",
+    )
+    parser.add_argument(
+        "--head-process-every",
+        type=int,
+        default=2,
+        help="Run head-pose estimation every N frames",
+    )
+    parser.add_argument("--head-left-threshold", type=float, default=-12.0)
+    parser.add_argument("--head-right-threshold", type=float, default=12.0)
+    parser.add_argument("--head-stability-frames", type=int, default=5)
+    parser.add_argument("--head-smoothing-frames", type=int, default=5)
+    parser.add_argument(
+        "--head-yaw-invert",
+        action="store_true",
+        help="Invert yaw before classifying left and right",
+    )
     parser.add_argument("--no-preview", action="store_true")
     parser.add_argument(
         "--capture-dir",
@@ -286,12 +307,25 @@ def main():
         parser.error("--trigger-frames must be at least 1")
     if args.movement_pixels < 1:
         parser.error("--movement-pixels must be at least 1")
+    if args.head_process_every < 1:
+        parser.error("--head-process-every must be at least 1")
+    if args.head_stability_frames < 1:
+        parser.error("--head-stability-frames must be at least 1")
+    if args.head_smoothing_frames < 1:
+        parser.error("--head-smoothing-frames must be at least 1")
+    if args.head_left_threshold >= args.head_right_threshold:
+        parser.error("--head-left-threshold must be less than --head-right-threshold")
     if args.max_frames < 0:
         parser.error("--max-frames must be non-negative")
     if args.cooldown < 0:
         parser.error("--cooldown must be non-negative")
     if not 0 < args.zone_bottom <= 1:
         parser.error("--zone-bottom must be in (0, 1]")
+
+    head_estimator = HeadPoseEstimator() if args.head_direction else None
+    if head_estimator is not None:
+        print("Head pose enabled: MediaPipe Face Landmarker", flush=True)
+    from ultralytics import YOLO
 
     model = YOLO(args.model)
     camera = (
@@ -308,6 +342,12 @@ def main():
     track_history = defaultdict(lambda: deque(maxlen=10))
     frames_seen = 0
     face_detector = create_face_detector() if args.look_trigger else None
+    head_yaws = deque(maxlen=args.head_smoothing_frames)
+    head_direction = "unknown"
+    head_candidate = "unknown"
+    head_candidate_frames = 0
+    head_missing_frames = 0
+    last_head_yaw = None
     try:
         while True:
             if args.max_frames and frames_seen >= args.max_frames:
@@ -332,6 +372,43 @@ def main():
                 verbose=False,
             )[0]
             trigger_person = False
+
+            if head_estimator is not None and frames_seen % args.head_process_every == 0:
+                pose = head_estimator.estimate(frame)
+                if pose is None:
+                    head_missing_frames += 1
+                else:
+                    head_missing_frames = 0
+                    last_head_yaw = pose.yaw
+                    head_yaws.append(pose.yaw)
+                if head_yaws:
+                    smoothed_yaw = float(np.median(head_yaws))
+                    raw_direction = classify_head_direction(
+                        smoothed_yaw,
+                        args.head_left_threshold,
+                        args.head_right_threshold,
+                        args.head_yaw_invert,
+                    )
+                else:
+                    smoothed_yaw = None
+                    raw_direction = "unknown"
+                if head_missing_frames >= args.head_stability_frames * 2:
+                    raw_direction = "unknown"
+                if raw_direction == head_candidate:
+                    head_candidate_frames += 1
+                else:
+                    head_candidate = raw_direction
+                    head_candidate_frames = 1
+                if (
+                    head_candidate_frames >= args.head_stability_frames
+                    and head_direction != head_candidate
+                ):
+                    head_direction = head_candidate
+                    yaw_text = "none" if smoothed_yaw is None else f"{smoothed_yaw:.1f}"
+                    print(
+                        f"Head direction: {head_direction} yaw={yaw_text}",
+                        flush=True,
+                    )
 
             track_ids = (
                 result.boxes.id.int().tolist()
@@ -427,6 +504,9 @@ def main():
                 f"person={int(trigger_person)} "
                 f"frames={consecutive}/{args.trigger_frames}"
             )
+            if head_estimator is not None:
+                yaw_text = "none" if last_head_yaw is None else f"{last_head_yaw:.1f}"
+                status += f" head={head_direction} yaw={yaw_text}"
             cv2.rectangle(frame, (0, 0), (width - 1, zone_bottom), (255, 180, 0), 1)
             cv2.putText(
                 frame,
@@ -442,6 +522,8 @@ def main():
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
     finally:
+        if head_estimator is not None:
+            head_estimator.close()
         camera.release()
         cv2.destroyAllWindows()
 

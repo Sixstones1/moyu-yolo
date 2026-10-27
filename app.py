@@ -57,6 +57,26 @@ class BorderFlash(QWidget):
         painter.drawRect(self.rect().adjusted(4, 4, -5, -5))
 
 
+class GlassOverlay(QWidget):
+    def __init__(self, opacity):
+        super().__init__()
+        self.opacity = opacity
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+            | Qt.WindowType.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(22, 28, 36, int(self.opacity * 255)))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -69,6 +89,7 @@ class MainWindow(QMainWindow):
         self.process.finished.connect(self.process_finished)
         self.latest_capture = None
         self.alert_windows = []
+        self.glass_overlays = {}
         self.build_ui()
         self.refresh_windows()
         self.refresh_captures()
@@ -153,6 +174,59 @@ class MainWindow(QMainWindow):
         self.notification_check = QCheckBox("Windows 通知")
         self.notification_check.setToolTip("系统通知可能有延迟，默认关闭")
         settings_layout.addWidget(self.notification_check, 2, 3)
+        self.head_direction_check = QCheckBox("头向检测")
+        self.head_direction_check.setToolTip("使用同一摄像头帧估计你的头朝向")
+        settings_layout.addWidget(self.head_direction_check, 3, 0)
+        self.glass_check = QCheckBox("另一块屏幕遮罩")
+        self.glass_check.setToolTip("看左屏时遮右屏，看右屏时遮左屏")
+        settings_layout.addWidget(self.glass_check, 3, 1)
+        settings_layout.addWidget(QLabel("头部检测间隔"), 3, 2)
+        self.head_interval_spin = QSpinBox()
+        self.head_interval_spin.setRange(1, 10)
+        self.head_interval_spin.setValue(2)
+        self.head_interval_spin.setSuffix(" 帧")
+        settings_layout.addWidget(self.head_interval_spin, 3, 3)
+        settings_layout.addWidget(QLabel("左转阈值"), 4, 0)
+        self.head_left_spin = QDoubleSpinBox()
+        self.head_left_spin.setRange(-90, 0)
+        self.head_left_spin.setSingleStep(1)
+        self.head_left_spin.setValue(-12)
+        self.head_left_spin.setSuffix("°")
+        settings_layout.addWidget(self.head_left_spin, 4, 1)
+        settings_layout.addWidget(QLabel("右转阈值"), 4, 2)
+        self.head_right_spin = QDoubleSpinBox()
+        self.head_right_spin.setRange(0, 90)
+        self.head_right_spin.setSingleStep(1)
+        self.head_right_spin.setValue(12)
+        self.head_right_spin.setSuffix("°")
+        settings_layout.addWidget(self.head_right_spin, 4, 3)
+        settings_layout.addWidget(QLabel("方向稳定帧"), 5, 0)
+        self.head_stability_spin = QSpinBox()
+        self.head_stability_spin.setRange(1, 30)
+        self.head_stability_spin.setValue(5)
+        settings_layout.addWidget(self.head_stability_spin, 5, 1)
+        settings_layout.addWidget(QLabel("遮罩透明度"), 5, 2)
+        self.glass_opacity_spin = QDoubleSpinBox()
+        self.glass_opacity_spin.setRange(0.1, 1.0)
+        self.glass_opacity_spin.setSingleStep(0.05)
+        self.glass_opacity_spin.setValue(0.72)
+        self.glass_opacity_spin.setSuffix(" ")
+        settings_layout.addWidget(self.glass_opacity_spin, 5, 3)
+        self.head_invert_check = QCheckBox("反转左右")
+        self.head_invert_check.setToolTip("摄像头方向导致左右相反时勾选")
+        settings_layout.addWidget(self.head_invert_check, 6, 0)
+        self.test_left_glass_button = QPushButton("测试遮左屏")
+        self.test_left_glass_button.setObjectName("secondary")
+        self.test_left_glass_button.clicked.connect(lambda: self.show_glass_for("right"))
+        settings_layout.addWidget(self.test_left_glass_button, 6, 1)
+        self.test_right_glass_button = QPushButton("测试遮右屏")
+        self.test_right_glass_button.setObjectName("secondary")
+        self.test_right_glass_button.clicked.connect(lambda: self.show_glass_for("left"))
+        settings_layout.addWidget(self.test_right_glass_button, 6, 2)
+        self.clear_glass_button = QPushButton("关闭遮罩")
+        self.clear_glass_button.setObjectName("secondary")
+        self.clear_glass_button.clicked.connect(lambda: self.show_glass_for("center"))
+        settings_layout.addWidget(self.clear_glass_button, 6, 3)
         layout.addWidget(settings_group)
 
         capture_group = QFrame()
@@ -291,6 +365,22 @@ class MainWindow(QMainWindow):
         ]
         if self.look_trigger_check.isChecked():
             args.append("--look-trigger")
+        if self.head_direction_check.isChecked() or self.glass_check.isChecked():
+            args.extend(
+                [
+                    "--head-direction",
+                    "--head-process-every",
+                    str(self.head_interval_spin.value()),
+                    "--head-left-threshold",
+                    str(self.head_left_spin.value()),
+                    "--head-right-threshold",
+                    str(self.head_right_spin.value()),
+                    "--head-stability-frames",
+                    str(self.head_stability_spin.value()),
+                ]
+            )
+            if self.head_invert_check.isChecked():
+                args.append("--head-yaw-invert")
         self.process.setProgram(str(PYTHONW))
         self.process.setArguments(args)
         self.process.start()
@@ -316,6 +406,11 @@ class MainWindow(QMainWindow):
                 self.status_label.setText("已切换到目标应用")
                 if self.notification_check.isChecked():
                     self.send_private_notification()
+            elif line.startswith("Head direction:"):
+                direction = line.split()[2] if len(line.split()) >= 3 else "unknown"
+                self.status_label.setText(f"头部方向：{direction}")
+                if self.glass_check.isChecked():
+                    self.show_glass_for(direction)
 
     def read_error(self):
         text = bytes(self.process.readAllStandardError()).decode("utf-8", errors="replace")
@@ -325,6 +420,7 @@ class MainWindow(QMainWindow):
     def process_finished(self, _exit_code, _exit_status):
         self.start_button.setText("开始监测")
         self.test_button.setEnabled(True)
+        self.show_glass_for("center")
         if self.status_label.text() not in ("已切换到目标应用",):
             self.status_label.setText("监测已停止")
         self.append_log("监测进程已停止")
@@ -387,11 +483,38 @@ class MainWindow(QMainWindow):
         if widget in self.alert_windows:
             self.alert_windows.remove(widget)
 
+    def ordered_screens(self):
+        return sorted(
+            QApplication.screens(),
+            key=lambda screen: (screen.geometry().x(), screen.geometry().y()),
+        )
+
+    def show_glass_for(self, direction):
+        screens = self.ordered_screens()
+        if len(screens) < 2 or direction not in ("left", "right"):
+            for overlay in self.glass_overlays.values():
+                overlay.hide()
+            return
+        target_index = 1 if direction == "left" else 0
+        for index, screen in enumerate(screens[:2]):
+            overlay = self.glass_overlays.get(index)
+            if overlay is None:
+                overlay = GlassOverlay(self.glass_opacity_spin.value())
+                self.glass_overlays[index] = overlay
+            overlay.opacity = self.glass_opacity_spin.value()
+            overlay.setGeometry(screen.geometry())
+            if index == target_index:
+                overlay.show()
+                overlay.raise_()
+            else:
+                overlay.hide()
+
     def closeEvent(self, event):
         if self.process.state() != QProcess.ProcessState.NotRunning:
             self.process.terminate()
             if not self.process.waitForFinished(1500):
                 self.process.kill()
+        self.show_glass_for("center")
         event.accept()
 
 
